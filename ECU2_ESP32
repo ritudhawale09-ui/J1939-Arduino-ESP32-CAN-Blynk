@@ -1,0 +1,105 @@
+#define BLYNK_TEMPLATE_ID   "TMPL3KUGN2Xvt"
+#define BLYNK_TEMPLATE_NAME "Display Node"
+#define BLYNK_AUTH_TOKEN    "S0XbzfD12rGHm2LZcByWIoCCE_zTRarM"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <SPI.h>
+#include <mcp_can.h>
+
+// -------- WiFi Credentials --------
+char ssid[] = "Enter you wifi id";         
+char pass[] = "Enter you password";    
+
+// -------- MCP2515 Setup --------
+#define CS_PIN   5
+#define INT_PIN  4
+MCP_CAN CAN0(CS_PIN);
+
+// -------- J1939 PGNs --------
+const uint32_t PGN_ENG_SPEED = 0x18FEF100;  // Engine Speed (SPN 190)
+const uint32_t PGN_VEH_SPEED = 0x18FEF200;  // Vehicle Speed (SPN 84)
+
+// -------- Variables --------
+float engineRPM = 0.0;
+float vehicleSpeed = 0.0;
+
+// -------- Vehicle Speed Model --------
+float calcVehicleSpeed(float rpm) {
+  float gearRatio = 4.0;
+  float wheelCirc = 2.0;
+  return (rpm / gearRatio) * (wheelCirc / 60.0) * 3.6; // km/h
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("====================================");
+  Serial.println("   ESP32 Display Node (J1939 + Blynk Text Display)");
+  Serial.println("====================================");
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, pass);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println("\n✅ WiFi Connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Connect to Blynk Cloud
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  Blynk.connect();
+
+  // MCP2515 Initialization
+  SPI.begin(18, 19, 23, CS_PIN);
+  pinMode(INT_PIN, INPUT);
+
+  while (CAN_OK != CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ)) {
+    Serial.println("❌ CAN init failed, retrying...");
+    delay(1000);
+  }
+
+  CAN0.setMode(MCP_NORMAL);
+  Serial.println("✅ CAN initialized – listening for PGN 0xFEF1 (Engine Speed)");
+}
+
+void loop() {
+  Blynk.run();
+
+  unsigned long rxId;
+  byte len;
+  byte buf[8];
+
+  // Check for incoming CAN frame
+  if (CAN_MSGAVAIL == CAN0.checkReceive()) {
+    CAN0.readMsgBuf(&rxId, &len, buf);
+
+    if ((rxId & 0x1FFFF00) == 0xFEF100) {  // PGN 0xFEF1 → Engine Speed
+      uint16_t rawRPM = buf[0] | (buf[1] << 8);
+      engineRPM = rawRPM * 0.125; // SPN 190 scaling
+
+      // Calculate Vehicle Speed (SPN 84)
+      vehicleSpeed = calcVehicleSpeed(engineRPM);
+      uint16_t scaledSpeed = (uint16_t)(vehicleSpeed / 0.00390625);
+
+      // Transmit Vehicle Speed PGN 0xFEF2
+      byte data[8] = { lowByte(scaledSpeed), highByte(scaledSpeed), 0,0,0,0,0,0 };
+      CAN0.sendMsgBuf(PGN_VEH_SPEED, 1, 8, data);
+
+      // Format readable output
+      String engStr = "PGN: 0xFEF1 | SPN: 190 | Engine Speed: " + String(engineRPM, 1) + " RPM";
+      String vehStr = "PGN: 0xFEF2 | SPN: 84  | Vehicle Speed: " + String(vehicleSpeed, 2) + " km/h";
+
+      // Print on Serial Monitor
+      Serial.println("─────────────────────────────────────");
+      Serial.println(engStr);
+      Serial.println(vehStr);
+      Serial.println("─────────────────────────────────────");
+
+      // Send as character datastreams to Blynk
+      Blynk.virtualWrite(V0, engStr); // Engine Speed Text
+      Blynk.virtualWrite(V1, vehStr); // Vehicle Speed Text
+    }
+  }
